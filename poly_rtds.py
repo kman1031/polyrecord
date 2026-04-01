@@ -196,11 +196,15 @@ class PolyRTDS:
         if not payload:
             return
 
-        symbol = payload.get("symbol", "")
+        symbol = payload.get("symbol", "").lower()
         source_ts = payload.get("timestamp")
         value = payload.get("value")
 
         if not symbol or value is None:
+            return
+
+        # Only store prices for our 4 target assets, discard everything else
+        if symbol not in BINANCE_SYMBOLS:
             return
 
         source_ts_ms = None

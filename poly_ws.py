@@ -250,6 +250,15 @@ class PolyMarketWS:
             market_id = event.get("market", "")
             msg_ts = event.get("timestamp")
 
+            # ── Filter: only process events for our subscribed tokens ────────
+            # new_market and market_resolved may have no token_id — allow those
+            # through so we can handle lifecycle events for our markets.
+            # All other event types (book, price_change, trades, bbo) must
+            # have a token_id that belongs to one of our active markets.
+            if event_type not in ("new_market", "market_resolved"):
+                if not token_id or token_id not in self._subscribed_tokens:
+                    return
+
             # Convert timestamp to ms if it's a string
             msg_ts_ms = None
             if msg_ts:
@@ -264,7 +273,7 @@ class PolyMarketWS:
                 except (ValueError, TypeError):
                     pass
 
-            # Always store raw event
+            # Only store raw events for our tokens / lifecycle events
             self._writer.write(
                 "poly_ws_raw",
                 {
@@ -439,7 +448,7 @@ class PolyMarketWS:
     def _handle_new_market(self, event: dict):
         """Handle new_market event (log only; discovery handles subscription)."""
         question = event.get("question", "")
-        logger.info("New market created: %s", question[:80])
+        logger.debug("New market created: %s", question[:80])
 
     def _log_connection_event(self, event: str, detail: str = ""):
         """Write to connection_log table."""
