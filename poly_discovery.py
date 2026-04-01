@@ -1,15 +1,21 @@
 """
 Polymarket market discovery.
 
-Periodically queries the Gamma API to find active hourly markets
-for each asset. Maintains a registry of current and upcoming markets
-with their token IDs, so the WS client can subscribe/unsubscribe.
+Generates event slugs based on current UTC time and queries the Gamma API
+directly by slug. This is required because the restricted hourly up/down
+markets do not appear in generic list endpoints.
+
+Slug format: {prefix}-up-or-down-{month}-{day}-{year}-{hour}{am/pm}-et
+Example:     bitcoin-up-or-down-april-1-2026-1pm-et
+
+ET offset: UTC-4 (EDT, March–November) / UTC-5 (EST, November–March)
 """
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Callable, Awaitable
 
 import aiohttp
@@ -19,10 +25,70 @@ from config import (
     POLY_SERIES_SLUGS,
     DISCOVERY_POLL_INTERVAL,
     MARKET_PRE_SUBSCRIBE_SECS,
+    DISCOVERY_LOOKAHEAD_HOURS,
 )
 from utils import utc_now_ms, utc_now
 
 logger = logging.getLogger("polyrecord.discovery")
+
+# Month name mapping for slug generation
+_MONTHS = {
+    1: "january",
+    2: "february",
+    3: "march",
+    4: "april",
+    5: "may",
+    6: "june",
+    7: "july",
+    8: "august",
+    9: "september",
+    10: "october",
+    11: "november",
+    12: "december",
+}
+
+
+def _et_offset(dt: datetime) -> int:
+    """Return ET UTC offset in hours: -4 (EDT) or -5 (EST).
+
+    EDT: second Sunday of March → first Sunday of November
+    EST: otherwise
+    """
+    year = dt.year
+    # Second Sunday of March
+    march = datetime(year, 3, 8, 2, 0, tzinfo=timezone.utc)
+    edt_start = march + timedelta(days=(6 - march.weekday()) % 7)
+    # First Sunday of November
+    november = datetime(year, 11, 1, 2, 0, tzinfo=timezone.utc)
+    est_start = november + timedelta(days=(6 - november.weekday()) % 7)
+    dt_utc = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+    return -4 if edt_start <= dt_utc < est_start else -5
+
+
+def _build_slug(prefix: str, dt_utc: datetime) -> str:
+    """Build an event slug for the given UTC hour.
+
+    Converts UTC to ET, then formats as:
+    {prefix}-up-or-down-{month}-{day}-{year}-{hour}{am/pm}-et
+    """
+    offset = _et_offset(dt_utc)
+    dt_et = dt_utc + timedelta(hours=offset)
+    hour_24 = dt_et.hour  # 0-23 in ET
+
+    if hour_24 == 0:
+        hour_str = "12am"
+    elif hour_24 < 12:
+        hour_str = f"{hour_24}am"
+    elif hour_24 == 12:
+        hour_str = "12pm"
+    else:
+        hour_str = f"{hour_24 - 12}pm"
+
+    month = _MONTHS[dt_et.month]
+    day = dt_et.day
+    year = dt_et.year
+
+    return f"{prefix}-up-or-down-{month}-{day}-{year}-{hour_str}-et"
 
 
 @dataclass
@@ -33,9 +99,10 @@ class MarketInfo:
     asset: str  # BTC, ETH, SOL, XRP
     up_token_id: str  # CLOB token ID for "Up" outcome
     down_token_id: str  # CLOB token ID for "Down" outcome
-    start_time: datetime | None = None
-    end_time: datetime | None = None
+    start_time: datetime | None = None  # eventStartTime (candle open)
+    end_time: datetime | None = None  # endDate (candle close / resolution)
     question: str = ""
+    open_price: float | None = None  # eventMetadata.priceToBeat
     settled: bool = False
     result: str | None = None  # "Up" or "Down" after settlement
 
@@ -63,7 +130,6 @@ class MarketInfo:
 
 
 # Callback type: called when active markets change
-# Receives (new_token_ids_to_subscribe, old_token_ids_to_unsubscribe)
 MarketChangeCallback = Callable[[list[str], list[str]], Awaitable[None]]
 
 
@@ -71,12 +137,13 @@ class MarketDiscovery:
     """
     Discovers and tracks active Polymarket hourly markets.
 
+    Strategy: generate event slugs based on current UTC time and query
+    the Gamma API directly by slug. Generic list endpoints do not include
+    restricted hourly markets.
+
     Maintains:
     - current_markets: markets for the current hour
-    - upcoming_markets: markets for the next hour (pre-discovered)
-
-    Calls on_market_change callback when the active set changes,
-    so the WS client can dynamically subscribe/unsubscribe.
+    - upcoming_markets: markets for the next DISCOVERY_LOOKAHEAD_HOURS hours
     """
 
     def __init__(self, on_market_change: MarketChangeCallback | None = None):
@@ -87,7 +154,7 @@ class MarketDiscovery:
         self.current_markets: dict[str, MarketInfo] = {}
         self.upcoming_markets: dict[str, MarketInfo] = {}
 
-        # All known token_ids currently subscribed
+        # All token_ids currently subscribed
         self._subscribed_tokens: set[str] = set()
 
         self._running = False
@@ -97,15 +164,12 @@ class MarketDiscovery:
         """Start discovery: initial fetch + periodic polling."""
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
         self._running = True
-
-        # Initial discovery
         await self._discover_all()
-
-        # Start polling loop
         self._poll_task = asyncio.create_task(self._poll_loop())
         logger.info(
-            "MarketDiscovery started. Tracking %d current markets.",
+            "MarketDiscovery started. Current: %d markets, Upcoming: %d markets.",
             len(self.current_markets),
+            len(self.upcoming_markets),
         )
 
     async def stop(self):
@@ -123,7 +187,7 @@ class MarketDiscovery:
         logger.info("MarketDiscovery stopped.")
 
     def get_all_active_token_ids(self) -> list[str]:
-        """Return all token IDs that should be subscribed to."""
+        """Return all token IDs that should currently be subscribed."""
         tokens = []
         for m in self.current_markets.values():
             tokens.extend(m.token_ids)
@@ -159,32 +223,39 @@ class MarketDiscovery:
                 logger.exception("Error in discovery poll loop")
 
     async def _discover_all(self):
-        """Query Gamma API for all assets' active markets."""
+        """Query Gamma API for all assets across current + upcoming hours."""
+        now = utc_now()
+        # Floor to the current hour in UTC
+        current_hour = now.replace(minute=0, second=0, microsecond=0)
+
         new_current: dict[str, MarketInfo] = {}
         new_upcoming: dict[str, MarketInfo] = {}
 
-        for asset, slug in POLY_SERIES_SLUGS.items():
-            try:
-                markets = await self._fetch_series_markets(slug, asset)
-                for m in markets:
-                    if m.settled:
-                        continue
+        for asset, prefix in POLY_SERIES_SLUGS.items():
+            for hour_offset in range(DISCOVERY_LOOKAHEAD_HOURS + 1):
+                target_hour = current_hour + timedelta(hours=hour_offset)
+                slug = _build_slug(prefix, target_hour)
 
-                    # Classify: current (active now) vs upcoming (starts soon)
-                    if m.is_active:
-                        new_current[m.market_id] = m
-                    elif (
-                        m.starts_within_secs is not None
-                        and m.starts_within_secs <= MARKET_PRE_SUBSCRIBE_SECS
-                    ):
-                        new_upcoming[m.market_id] = m
+                market = await self._fetch_by_slug(slug, asset)
+                if market is None:
+                    continue
+                if market.settled:
+                    continue
 
-            except Exception:
-                logger.exception("Failed to discover markets for %s (slug=%s)", asset, slug)
+                if hour_offset == 0:
+                    # Current hour
+                    if market.is_active:
+                        new_current[market.market_id] = market
+                    # If not active yet (e.g. market not opened), treat as upcoming
+                    elif market.starts_within_secs is not None:
+                        new_upcoming[market.market_id] = market
+                else:
+                    # Future hour — pre-subscribe if within lookahead window
+                    new_upcoming[market.market_id] = market
 
-        # Determine token changes
+        # Compute token delta
         old_tokens = self._subscribed_tokens
-        new_tokens = set()
+        new_tokens: set[str] = set()
         for m in {**new_current, **new_upcoming}.values():
             new_tokens.update(m.token_ids)
 
@@ -209,153 +280,87 @@ class MarketDiscovery:
                 except Exception:
                     logger.exception("Error in on_market_change callback")
 
-    async def _fetch_series_markets(self, series_slug: str, asset: str) -> list[MarketInfo]:
-        """Fetch active markets for a given series slug from Gamma API.
-
-        Strategy:
-        1. Try GET /series?slug={slug} to get precise series data with events.
-        2. If that fails, fall back to GET /events with keyword filtering.
-        """
+    async def _fetch_by_slug(self, slug: str, asset: str) -> MarketInfo | None:
+        """Fetch a single event by exact slug and parse it into MarketInfo."""
         if not self._session:
-            return []
+            return None
 
-        # ── Attempt 1: series-specific endpoint ──────────────────
-        results = await self._fetch_via_series(series_slug, asset)
-        if results:
-            return results
-
-        # ── Attempt 2: fallback to generic events query ──────────
-        logger.debug(
-            "Series endpoint returned nothing for %s, falling back to /events", series_slug
-        )
-        return await self._fetch_via_events(asset)
-
-    async def _fetch_via_series(self, series_slug: str, asset: str) -> list[MarketInfo]:
-        """Try to fetch markets via the /series?slug= endpoint."""
-        url = f"{POLY_GAMMA_URL}/series"
-        params = {"slug": series_slug}
+        url = f"{POLY_GAMMA_URL}/events"
+        params = {"slug": slug}
 
         try:
             async with self._session.get(url, params=params) as resp:
                 if resp.status != 200:
-                    return []
+                    logger.debug("Gamma API %d for slug=%s", resp.status, slug)
+                    return None
                 data = await resp.json()
         except Exception:
-            logger.debug("Series endpoint failed for %s", series_slug)
-            return []
+            logger.exception("Failed to fetch slug=%s", slug)
+            return None
 
-        # data may be a list or a single object depending on the API version
-        series_list = data if isinstance(data, list) else [data]
-        results: list[MarketInfo] = []
+        if not data:
+            logger.debug("No event found for slug=%s", slug)
+            return None
 
-        for series in series_list:
-            events = series.get("events", [])
-            for event in events:
-                closed = event.get("closed", False)
-                if closed:
-                    continue
-                markets_data = event.get("markets", [])
-                for mkt in markets_data:
-                    mi = self._parse_market(mkt, event, asset)
-                    if mi:
-                        results.append(mi)
+        event = data[0]
+        markets_data = event.get("markets", [])
+        if not markets_data:
+            return None
 
-        return results
+        mkt = markets_data[0]
 
-    async def _fetch_via_events(self, asset: str) -> list[MarketInfo]:
-        """Fallback: fetch via generic /events endpoint with keyword filtering."""
-        url = f"{POLY_GAMMA_URL}/events"
-        params = {
-            "closed": "false",
-            "active": "true",
-            "tag": "crypto",
-            "limit": "100",
-            "order": "startDate",
-            "ascending": "true",
-        }
+        # clobTokenIds and outcomes are JSON strings — must parse them
+        try:
+            clob_tokens = json.loads(mkt.get("clobTokenIds", "[]"))
+        except (json.JSONDecodeError, TypeError):
+            clob_tokens = mkt.get("clobTokenIds", [])
 
         try:
-            async with self._session.get(url, params=params) as resp:
-                if resp.status != 200:
-                    logger.warning("Gamma /events returned %d", resp.status)
-                    return []
-                events = await resp.json()
-        except Exception:
-            logger.exception("Failed to fetch /events")
-            return []
+            outcomes = json.loads(mkt.get("outcomes", "[]"))
+        except (json.JSONDecodeError, TypeError):
+            outcomes = mkt.get("outcomes", [])
 
-        # Map asset names to possible keywords in questions
-        asset_keywords = {
-            "BTC": ["bitcoin", "btc"],
-            "ETH": ["ethereum", "eth"],
-            "SOL": ["solana", "sol"],
-            "XRP": ["xrp"],
-        }
-        keywords = asset_keywords.get(asset, [asset.lower()])
-
-        results: list[MarketInfo] = []
-        for event in events:
-            for mkt in event.get("markets", []):
-                question_lower = mkt.get("question", "").lower()
-
-                # Must match asset keyword
-                if not any(kw in question_lower for kw in keywords):
-                    continue
-                # Must be an up/down market
-                if "up" not in question_lower and "down" not in question_lower:
-                    continue
-
-                mi = self._parse_market(mkt, event, asset)
-                if mi:
-                    results.append(mi)
-
-        return results
-
-    def _parse_market(self, mkt: dict, event: dict, asset: str) -> MarketInfo | None:
-        """Parse a single market object from the Gamma API into MarketInfo."""
         condition_id = mkt.get("conditionId", "")
-        clob_tokens = mkt.get("clobTokenIds", [])
-        outcomes = mkt.get("outcomes", [])
         enable_ob = mkt.get("enableOrderBook", False)
 
         if not condition_id or len(clob_tokens) < 2:
+            logger.debug("Incomplete market data for slug=%s", slug)
             return None
         if not enable_ob:
+            logger.debug("Order book not enabled for slug=%s", slug)
             return None
 
-        # Determine up/down token ordering (outcomes is typically ["Up", "Down"])
-        up_idx = 0
-        down_idx = 1
+        # Determine Up/Down token index
+        up_idx, down_idx = 0, 1
         if len(outcomes) >= 2:
-            found_up = False
-            found_down = False
             for i, outcome in enumerate(outcomes):
-                if outcome.lower() == "up":
-                    up_idx = i
-                    found_up = True
-                elif outcome.lower() == "down":
-                    down_idx = i
-                    found_down = True
+                if isinstance(outcome, str):
+                    if outcome.lower() == "up":
+                        up_idx = i
+                    elif outcome.lower() == "down":
+                        down_idx = i
 
-            if not found_up or not found_down:
-                logger.warning(
-                    "Unexpected outcomes for %s: %s (question: %s)",
-                    condition_id[:16],
-                    outcomes,
-                    mkt.get("question", "")[:60],
-                )
-
-        # Parse times from the parent event
+        # Parse times — use eventStartTime for candle open, endDate for close
         start_time = None
         end_time = None
         try:
-            start_str = event.get("startDate") or event.get("startDateIso")
-            end_str = event.get("endDate") or event.get("endDateIso")
+            start_str = mkt.get("eventStartTime") or event.get("startDate")
+            end_str = mkt.get("endDate") or event.get("endDate")
             if start_str:
                 start_time = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
             if end_str:
                 end_time = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
         except (ValueError, TypeError):
+            pass
+
+        # Parse open price (the Binance price at candle open)
+        open_price = None
+        try:
+            meta = event.get("eventMetadata") or {}
+            if isinstance(meta, str):
+                meta = json.loads(meta)
+            open_price = float(meta.get("priceToBeat", 0)) or None
+        except (ValueError, TypeError, json.JSONDecodeError):
             pass
 
         return MarketInfo(
@@ -366,12 +371,11 @@ class MarketDiscovery:
             start_time=start_time,
             end_time=end_time,
             question=mkt.get("question", ""),
+            open_price=open_price,
         )
 
     async def write_markets_to_db(self, writer) -> None:
-        """Write current market metadata to the database via BufferedWriter.
-        Uses write_or_replace to handle duplicate market_ids safely.
-        """
+        """Write current market metadata to the database via BufferedWriter."""
         for m in {**self.current_markets, **self.upcoming_markets}.values():
             writer.write_or_replace(
                 "markets",
@@ -384,6 +388,7 @@ class MarketDiscovery:
                     "up_token_id": m.up_token_id,
                     "down_token_id": m.down_token_id,
                     "result": m.result,
+                    "open_price": m.open_price,
                     "bn_open_price": None,
                     "bn_close_price": None,
                     "created_at_ms": utc_now_ms(),

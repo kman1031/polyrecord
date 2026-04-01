@@ -13,14 +13,19 @@ DATA_DIR = Path(os.environ.get("POLYRECORD_DATA_DIR", BASE_DIR / "data"))
 # ── Assets & Series ─────────────────────────────────────────
 # Each entry: (display_name, binance_symbol, poly_series_slug)
 ASSETS = [
-    ("BTC", "btcusdt", "bitcoin-up-or-down-hourly"),
-    ("ETH", "ethusdt", "eth-up-or-down-hourly"),
-    ("SOL", "solusdt", "solana-up-or-down-hourly"),
-    ("XRP", "xrpusdt", "xrp-up-or-down-hourly"),
+    ("BTC", "btcusdt", "bitcoin"),
+    ("ETH", "ethusdt", "ethereum"),
+    ("SOL", "solusdt", "solana"),
+    ("XRP", "xrpusdt", "xrp"),
 ]
 
 BINANCE_SYMBOLS = [a[1] for a in ASSETS]  # ["btcusdt", ...]
-POLY_SERIES_SLUGS = {a[0]: a[2] for a in ASSETS}  # {"BTC": "bitcoin-up-or-down-hourly", ...}
+POLY_SERIES_SLUGS = {a[0]: a[2] for a in ASSETS}  # {"BTC": "bitcoin", ...}
+
+# Slug format: {prefix}-up-or-down-{month}-{day}-{year}-{hour}{am/pm}-et
+# e.g. "bitcoin-up-or-down-april-1-2026-1pm-et"
+# Discovery queries current hour + next N hours to pre-subscribe upcoming markets
+DISCOVERY_LOOKAHEAD_HOURS = 2
 
 # ── Polymarket endpoints ─────────────────────────────────────
 POLY_CLOB_URL = "https://clob.polymarket.com"

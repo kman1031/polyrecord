@@ -15,6 +15,7 @@ TABLES = {
             up_token_id     TEXT,
             down_token_id   TEXT,
             result          TEXT,
+            open_price      REAL,
             bn_open_price   REAL,
             bn_close_price  REAL,
             created_at_ms   INTEGER
