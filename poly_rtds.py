@@ -110,7 +110,9 @@ class PolyRTDS:
             self._last_msg_time = asyncio.get_running_loop().time()
             self._log_connection_event("connected", "")
 
-            # Subscribe to crypto prices
+            # Subscribe to crypto prices (no filters = receive all symbols)
+            # Filters field expects a JSON object/array, not a comma-separated
+            # string. Omitting filters is the simplest working approach.
             sub_msg = json.dumps(
                 {
                     "action": "subscribe",
@@ -118,13 +120,12 @@ class PolyRTDS:
                         {
                             "topic": "crypto_prices",
                             "type": "update",
-                            "filters": ",".join(BINANCE_SYMBOLS),
                         }
                     ],
                 }
             )
             await ws.send(sub_msg)
-            logger.info("RTDS subscribed to: %s", ", ".join(BINANCE_SYMBOLS))
+            logger.info("RTDS subscribed to crypto_prices (all symbols)")
 
             # Run ping + reader + silence detector concurrently
             ping_task = asyncio.create_task(self._ping_loop(ws))
