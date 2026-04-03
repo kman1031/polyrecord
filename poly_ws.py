@@ -302,9 +302,18 @@ class PolyMarketWS:
             # tick_size_change is stored raw only (in poly_ws_raw above)
 
     def _parse_book(self, recv_ts: int, market_id: str, token_id: str, event: dict):
-        """Parse book event into poly_orderbook rows."""
+        """Parse book event into poly_orderbook rows.
+
+        Also derives BBO from the best bid/ask in the book snapshot and writes
+        to poly_bbo — this is the fallback for when best_bid_ask / price_change
+        events are not pushed by the server.
+        """
+        best_bid = None
+        best_ask = None
+
         for side_key, side_label in [("bids", "bid"), ("asks", "ask")]:
-            for level, entry in enumerate(event.get(side_key, [])):
+            entries = event.get(side_key, [])
+            for level, entry in enumerate(entries):
                 price = float(entry.get("price", 0))
                 size = float(entry.get("size", 0))
                 if size > 0:
@@ -321,6 +330,24 @@ class PolyMarketWS:
                             "source": "ws",
                         },
                     )
+                    # Track best bid (highest bid price) and best ask (lowest ask price)
+                    if side_label == "bid" and (best_bid is None or price > best_bid):
+                        best_bid = price
+                    elif side_label == "ask" and (best_ask is None or price < best_ask):
+                        best_ask = price
+
+        # Write derived BBO if we have at least one side
+        if best_bid is not None or best_ask is not None:
+            self._writer.write(
+                "poly_bbo",
+                {
+                    "recv_ts_ms": recv_ts,
+                    "token_id": token_id,
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "spread": (best_ask - best_bid) if best_bid and best_ask else None,
+                },
+            )
 
     def _parse_price_change(self, recv_ts: int, market_id: str, token_id: str, event: dict):
         """Parse price_change event into poly_bbo rows.

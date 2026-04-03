@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Polyrecord Dashboard</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <h1 class="title">POLYRECORD</h1>
+            <div class="subtitle">Polymarket + Binance Data Recorder</div>
+            <div class="status-indicator" id="connection-status">
+                <span class="status-dot"></span>
+                <span class="status-text">Connecting...</span>
+            </div>
+        </header>
+
+        <section class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">Total Rows</div>
+                <div class="stat-value" id="total-rows">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Database Size</div>
+                <div class="stat-value" id="db-size">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Active Markets</div>
+                <div class="stat-value" id="active-markets">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Last Update</div>
+                <div class="stat-value" id="last-update">-</div>
+            </div>
+        </section>
+
+        <section class="data-section">
+            <h2 class="section-title">Binance Prices (Last Hour)</h2>
+            <div class="charts-grid">
+                <div class="chart-container">
+                    <canvas id="btc-chart"></canvas>
+                </div>
+                <div class="chart-container">
+                    <canvas id="eth-chart"></canvas>
+                </div>
+                <div class="chart-container">
+                    <canvas id="sol-chart"></canvas>
+                </div>
+                <div class="chart-container">
+                    <canvas id="xrp-chart"></canvas>
+                </div>
+            </div>
+        </section>
+
+        <section class="data-section">
+            <h2 class="section-title">Table Statistics</h2>
+            <div class="table-stats">
+                <div class="table-row">
+                    <span class="table-name">Binance BBO</span>
+                    <span class="table-count" id="bn-bbo-count">-</span>
+                </div>
+                <div class="table-row">
+                    <span class="table-name">Binance Kline 1m</span>
+                    <span class="table-count" id="bn-kline-count">-</span>
+                </div>
+                <div class="table-row">
+                    <span class="table-name">Polymarket BBO</span>
+                    <span class="table-count" id="poly-bbo-count">-</span>
+                </div>
+                <div class="table-row">
+                    <span class="table-name">Polymarket Trades</span>
+                    <span class="table-count" id="poly-trades-count">-</span>
+                </div>
+                <div class="table-row">
+                    <span class="table-name">Polymarket Orderbook</span>
+                    <span class="table-count" id="poly-orderbook-count">-</span>
+                </div>
+                <div class="table-row">
+                    <span class="table-name">RTDS Prices</span>
+                    <span class="table-count" id="rtds-count">-</span>
+                </div>
+            </div>
+        </section>
+
+        <section class="data-section">
+            <h2 class="section-title">Market Status</h2>
+            <div class="markets-grid" id="markets-grid">
+                <div class="loading">Loading markets...</div>
+            </div>
+        </section>
+
+        <section class="data-section">
+            <h2 class="section-title">RTDS Prices</h2>
+            <div class="rtds-grid" id="rtds-grid">
+                <div class="loading">Loading RTDS data...</div>
+            </div>
+        </section>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

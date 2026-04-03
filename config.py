@@ -25,7 +25,7 @@ POLY_SERIES_SLUGS = {a[0]: a[2] for a in ASSETS}  # {"BTC": "bitcoin", ...}
 # Slug format: {prefix}-up-or-down-{month}-{day}-{year}-{hour}{am/pm}-et
 # e.g. "bitcoin-up-or-down-april-1-2026-1pm-et"
 # Discovery queries current hour + next N hours to pre-subscribe upcoming markets
-DISCOVERY_LOOKAHEAD_HOURS = 2
+DISCOVERY_LOOKAHEAD_HOURS = 4
 
 # ── Polymarket endpoints ─────────────────────────────────────
 POLY_CLOB_URL = "https://clob.polymarket.com"

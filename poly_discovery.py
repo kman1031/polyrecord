@@ -223,7 +223,14 @@ class MarketDiscovery:
                 logger.exception("Error in discovery poll loop")
 
     async def _discover_all(self):
-        """Query Gamma API for all assets across current + upcoming hours."""
+        """Query Gamma API for all assets across current + upcoming hours.
+
+        Strategy:
+        1. Try slug-based lookup for current + next DISCOVERY_LOOKAHEAD_HOURS hours
+        2. If no markets found (e.g. ET midnight crossover, Polymarket hasn't
+           created next-day markets yet), fall back to series API which returns
+           the most recent active/upcoming markets regardless of day boundary.
+        """
         now = utc_now()
         # Floor to the current hour in UTC
         current_hour = now.replace(minute=0, second=0, microsecond=0)
@@ -232,6 +239,7 @@ class MarketDiscovery:
         new_upcoming: dict[str, MarketInfo] = {}
 
         for asset, prefix in POLY_SERIES_SLUGS.items():
+            found_any = False
             for hour_offset in range(DISCOVERY_LOOKAHEAD_HOURS + 1):
                 target_hour = current_hour + timedelta(hours=hour_offset)
                 slug = _build_slug(prefix, target_hour)
@@ -242,6 +250,7 @@ class MarketDiscovery:
                 if market.settled:
                     continue
 
+                found_any = True
                 if hour_offset == 0:
                     # Current hour
                     if market.is_active:
@@ -252,6 +261,30 @@ class MarketDiscovery:
                 else:
                     # Future hour — pre-subscribe if within lookahead window
                     new_upcoming[market.market_id] = market
+
+            # ── Fallback: series API ──────────────────────────────────────────
+            # If slug lookup found nothing (Polymarket hasn't published next-day
+            # markets yet, common during ET midnight crossover), query the series
+            # endpoint which always returns the latest active markets.
+            if not found_any:
+                logger.warning(
+                    "%s: no markets found via slug lookup, trying series fallback", asset
+                )
+                series_markets = await self._fetch_series_fallback(prefix, asset)
+                for market in series_markets:
+                    if market.settled:
+                        continue
+                    if market.is_active:
+                        new_current[market.market_id] = market
+                        found_any = True
+                    elif market.starts_within_secs is not None:
+                        new_upcoming[market.market_id] = market
+                        found_any = True
+
+                if found_any:
+                    logger.info("%s: series fallback found %d markets", asset, len(series_markets))
+                else:
+                    logger.warning("%s: series fallback also found nothing", asset)
 
         # Compute token delta
         old_tokens = self._subscribed_tokens
@@ -280,7 +313,51 @@ class MarketDiscovery:
                 except Exception:
                     logger.exception("Error in on_market_change callback")
 
-    async def _fetch_by_slug(self, slug: str, asset: str) -> MarketInfo | None:
+    async def _fetch_series_fallback(self, series_slug: str, asset: str) -> list["MarketInfo"]:
+        """Fetch the latest active markets from the series endpoint.
+
+        Used when slug-based lookup returns nothing (ET midnight crossover).
+        Queries /events?seriesSlug=<slug>&closed=false&active=true ordered by
+        endDate ascending, and returns the first few markets.
+        """
+        if not self._session:
+            return []
+
+        url = f"{POLY_GAMMA_URL}/events"
+        params = {
+            "seriesSlug": f"{series_slug}-up-or-down-hourly",
+            "closed": "false",
+            "active": "true",
+            "order": "endDate",
+            "ascending": "true",
+            "limit": str(DISCOVERY_LOOKAHEAD_HOURS + 2),
+        }
+
+        try:
+            async with self._session.get(url, params=params) as resp:
+                if resp.status != 200:
+                    logger.debug("Series fallback API %d for series=%s", resp.status, series_slug)
+                    return []
+                data = await resp.json()
+        except Exception:
+            logger.exception("Failed series fallback for series=%s", series_slug)
+            return []
+
+        if not data:
+            return []
+
+        results = []
+        for event in data:
+            markets_data = event.get("markets", [])
+            if not markets_data:
+                continue
+            market = await self._parse_market_event(event, markets_data[0], asset)
+            if market:
+                results.append(market)
+
+        return results
+
+    async def _fetch_by_slug(self, slug: str, asset: str) -> "MarketInfo | None":
         """Fetch a single event by exact slug and parse it into MarketInfo."""
         if not self._session:
             return None
@@ -307,8 +384,10 @@ class MarketDiscovery:
         if not markets_data:
             return None
 
-        mkt = markets_data[0]
+        return await self._parse_market_event(event, markets_data[0], asset)
 
+    async def _parse_market_event(self, event: dict, mkt: dict, asset: str) -> "MarketInfo | None":
+        """Parse a Gamma API event + market dict into a MarketInfo object."""
         # clobTokenIds and outcomes are JSON strings — must parse them
         try:
             clob_tokens = json.loads(mkt.get("clobTokenIds", "[]"))
@@ -324,10 +403,8 @@ class MarketDiscovery:
         enable_ob = mkt.get("enableOrderBook", False)
 
         if not condition_id or len(clob_tokens) < 2:
-            logger.debug("Incomplete market data for slug=%s", slug)
             return None
         if not enable_ob:
-            logger.debug("Order book not enabled for slug=%s", slug)
             return None
 
         # Determine Up/Down token index
@@ -363,6 +440,24 @@ class MarketDiscovery:
         except (ValueError, TypeError, json.JSONDecodeError):
             pass
 
+        # Check if already resolved (umaResolutionStatus == "resolved" is the
+        # definitive signal; closed=True alone just means trading ended but
+        # the market may still be awaiting oracle resolution)
+        settled = False
+        result = None
+        if mkt.get("umaResolutionStatus") == "resolved":
+            settled = True
+            # outcomePrices: ["1","0"] means Up won, ["0","1"] means Down won
+            try:
+                outcome_prices = json.loads(mkt.get("outcomePrices", "[]"))
+                if len(outcome_prices) >= 2 and len(outcomes) >= 2:
+                    for i, price in enumerate(outcome_prices):
+                        if float(price) >= 0.99:
+                            result = outcomes[i] if i < len(outcomes) else None
+                            break
+            except (ValueError, TypeError, json.JSONDecodeError):
+                pass
+
         return MarketInfo(
             market_id=condition_id,
             asset=asset,
@@ -372,6 +467,8 @@ class MarketDiscovery:
             end_time=end_time,
             question=mkt.get("question", ""),
             open_price=open_price,
+            settled=settled,
+            result=result,
         )
 
     async def write_markets_to_db(self, writer) -> None:
@@ -394,3 +491,117 @@ class MarketDiscovery:
                     "created_at_ms": utc_now_ms(),
                 },
             )
+
+    async def poll_settled_results(self, writer, binance_ws=None) -> int:
+        """Poll Gamma API to check if any tracked markets have settled.
+
+        Called periodically as a fallback for when market_resolved WS events
+        are not received. Returns the number of newly settled markets found.
+        """
+        if not self._session:
+            return 0
+
+        all_markets = {**self.current_markets, **self.upcoming_markets}
+        if not all_markets:
+            return 0
+
+        newly_settled = 0
+        now = utc_now()
+
+        for market_id, market in list(all_markets.items()):
+            # Only check markets whose end_time has passed and aren't settled yet
+            if market.settled:
+                continue
+            if market.end_time and now < market.end_time:
+                continue
+
+            # Fetch fresh data via conditionId
+            url = f"{POLY_GAMMA_URL}/markets"
+            params = {"conditionId": market_id}
+
+            try:
+                async with self._session.get(url, params=params) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+            except Exception:
+                logger.debug("Failed to poll settlement for %s", market_id[:16])
+                continue
+
+            if not data:
+                continue
+
+            mkt = data[0] if isinstance(data, list) else data
+
+            # Check resolution status — only trust umaResolutionStatus
+            if mkt.get("umaResolutionStatus") != "resolved":
+                continue
+
+            # Parse winner from outcomePrices
+            result = None
+            try:
+                outcome_prices = json.loads(mkt.get("outcomePrices", "[]"))
+                outcomes = json.loads(mkt.get("outcomes", "[]"))
+                for i, price in enumerate(outcome_prices):
+                    if float(price) >= 0.99 and i < len(outcomes):
+                        result = outcomes[i]
+                        break
+            except (ValueError, TypeError, json.JSONDecodeError):
+                pass
+
+            if result is None:
+                continue
+
+            # Update in-memory state
+            market.settled = True
+            market.result = result
+            newly_settled += 1
+            logger.info("REST poll: market %s settled → %s", market_id[:16], result)
+
+            # Get Binance open/close prices if available
+            bn_open = bn_close = None
+            if binance_ws and market.start_time:
+                from config import ASSETS
+
+                for name, sym, _ in ASSETS:
+                    if name == market.asset:
+                        hour_start_ms = int(market.start_time.timestamp() * 1000)
+                        bn_open, bn_close = binance_ws.get_hourly_price(sym, hour_start_ms)
+                        break
+
+            # Also check open_price from eventMetadata if not already set
+            open_price = market.open_price
+            if open_price is None:
+                try:
+                    meta = mkt.get("eventMetadata") or {}
+                    if isinstance(meta, str):
+                        import json as _json
+
+                        meta = _json.loads(meta)
+                    open_price = float(meta.get("priceToBeat", 0)) or None
+                except Exception:
+                    pass
+
+            writer.write_or_replace(
+                "markets",
+                {
+                    "market_id": market.market_id,
+                    "asset": market.asset,
+                    "timeframe": "1h",
+                    "start_time_ms": int(market.start_time.timestamp() * 1000)
+                    if market.start_time
+                    else None,
+                    "end_time_ms": int(market.end_time.timestamp() * 1000)
+                    if market.end_time
+                    else None,
+                    "up_token_id": market.up_token_id,
+                    "down_token_id": market.down_token_id,
+                    "result": result,
+                    "open_price": open_price,
+                    "bn_open_price": bn_open,
+                    "bn_close_price": bn_close,
+                    "created_at_ms": utc_now_ms(),
+                },
+            )
+
+        return newly_settled

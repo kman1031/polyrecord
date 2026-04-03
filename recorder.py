@@ -45,6 +45,7 @@ class Recorder:
         self._snapshot: SnapshotPoller | None = None
         self._health: HealthChecker | None = None
         self._shutdown_event = asyncio.Event()
+        self._tasks: list[asyncio.Task] = []
 
     async def run(self):
         """Start all components and run until shutdown signal."""
@@ -142,9 +143,37 @@ class Recorder:
         await self._snapshot.fetch_once()
         logger.info("Initial market metadata written and snapshot taken")
 
+        # Start settlement polling loop (REST fallback for market_resolved events)
+        self._tasks.append(asyncio.create_task(self._settlement_poll_loop()))
+
+    async def _settlement_poll_loop(self):
+        """Poll REST API every 5 minutes to catch settled markets.
+
+        This is a fallback for when market_resolved WS events are not received.
+        """
+        POLL_INTERVAL = 300  # 5 minutes
+        while True:
+            try:
+                await asyncio.sleep(POLL_INTERVAL)
+                if self._discovery and self._writer:
+                    n = await self._discovery.poll_settled_results(self._writer, self._binance_ws)
+                    if n > 0:
+                        logger.info("Settlement poll: %d newly settled markets", n)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Error in settlement poll loop")
+
     async def _stop_all(self):
         """Stop all components in reverse order."""
         logger.info("Shutting down all components...")
+        for task in self._tasks:
+            task.cancel()
+        for task in self._tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
         components = [
             ("HealthChecker", self._health),
