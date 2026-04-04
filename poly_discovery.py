@@ -153,6 +153,7 @@ class MarketDiscovery:
         # market_id → MarketInfo
         self.current_markets: dict[str, MarketInfo] = {}
         self.upcoming_markets: dict[str, MarketInfo] = {}
+        self.settled_markets: dict[str, MarketInfo] = {}
 
         # All token_ids currently subscribed
         self._subscribed_tokens: set[str] = set()
@@ -197,7 +198,7 @@ class MarketDiscovery:
 
     def get_market_by_token(self, token_id: str) -> MarketInfo | None:
         """Look up a market by either of its token IDs."""
-        for m in {**self.current_markets, **self.upcoming_markets}.values():
+        for m in {**self.current_markets, **self.upcoming_markets, **self.settled_markets}.values():
             if token_id in m.token_ids:
                 return m
         return None
@@ -208,6 +209,7 @@ class MarketDiscovery:
             if market_id in registry:
                 registry[market_id].settled = True
                 registry[market_id].result = result
+                self.settled_markets[market_id] = registry[market_id]
                 logger.info("Market %s resolved: %s", market_id[:16], result)
                 return
 
@@ -221,6 +223,17 @@ class MarketDiscovery:
                 raise
             except Exception:
                 logger.exception("Error in discovery poll loop")
+
+    def _evict_old_settled(self, now: datetime):
+        """Remove settled markets older than 3 hours to bound memory."""
+        cutoff = now - timedelta(hours=3)
+        to_remove = [
+            mid for mid, m in self.settled_markets.items() if m.end_time and m.end_time < cutoff
+        ]
+        for mid in to_remove:
+            del self.settled_markets[mid]
+        if to_remove:
+            logger.debug("Evicted %d old settled markets", len(to_remove))
 
     async def _discover_all(self):
         """Query Gamma API for all assets across current + upcoming hours.
@@ -248,6 +261,8 @@ class MarketDiscovery:
                 if market is None:
                     continue
                 if market.settled:
+                    self.settled_markets[market.market_id] = market
+                    found_any = True
                     continue
 
                 found_any = True
@@ -273,6 +288,8 @@ class MarketDiscovery:
                 series_markets = await self._fetch_series_fallback(prefix, asset)
                 for market in series_markets:
                     if market.settled:
+                        self.settled_markets[market.market_id] = market
+                        found_any = True
                         continue
                     if market.is_active:
                         new_current[market.market_id] = market
@@ -298,6 +315,8 @@ class MarketDiscovery:
         self.current_markets = new_current
         self.upcoming_markets = new_upcoming
         self._subscribed_tokens = new_tokens
+
+        self._evict_old_settled(now)
 
         if to_subscribe or to_unsubscribe:
             logger.info(
@@ -473,7 +492,7 @@ class MarketDiscovery:
 
     async def write_markets_to_db(self, writer) -> None:
         """Write current market metadata to the database via BufferedWriter."""
-        for m in {**self.current_markets, **self.upcoming_markets}.values():
+        for m in {**self.current_markets, **self.upcoming_markets, **self.settled_markets}.values():
             writer.write_or_replace(
                 "markets",
                 {
@@ -501,7 +520,11 @@ class MarketDiscovery:
         if not self._session:
             return 0
 
-        all_markets = {**self.current_markets, **self.upcoming_markets}
+        all_markets = {
+            **self.current_markets,
+            **self.upcoming_markets,
+            **self.settled_markets,
+        }
         if not all_markets:
             return 0
 
@@ -509,7 +532,6 @@ class MarketDiscovery:
         now = utc_now()
 
         for market_id, market in list(all_markets.items()):
-            # Only check markets whose end_time has passed and aren't settled yet
             if market.settled:
                 continue
             if market.end_time and now < market.end_time:

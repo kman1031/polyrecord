@@ -40,7 +40,7 @@ BINANCE_WS_URL = "wss://stream.binance.com:9443/stream"
 POLY_WS_PING_INTERVAL = 9.0  # Poly requires PING every 10s, send at 9s for safety
 POLY_RTDS_PING_INTERVAL = 4.0  # RTDS requires PING every 5s, send at 4s
 POLY_WS_SILENCE_TIMEOUT = 20.0  # No message for this long → reconnect
-POLY_RTDS_SILENCE_TIMEOUT = 10.0  # RTDS should have much more frequent messages
+POLY_RTDS_SILENCE_TIMEOUT = 15.0  # RTDS should have much more frequent messages
 BINANCE_WS_SILENCE_TIMEOUT = 15.0
 
 # ── Reconnection ─────────────────────────────────────────────
@@ -63,5 +63,5 @@ SNAPSHOT_INTERVAL = 30  # REST orderbook snapshot every 30 seconds
 HEALTH_CHECK_INTERVAL = 30  # Check every 30 seconds
 
 # ── Compression ──────────────────────────────────────────────
-COMPRESS_AFTER_DAYS = 1  # Compress db files older than N days
+COMPRESS_AFTER_DAYS = 3  # Compress db files older than N days
 DISK_USAGE_WARN_GB = 5.0  # Warn when free space below N GB
